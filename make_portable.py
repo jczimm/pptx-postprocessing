@@ -16,11 +16,15 @@ Modes (compose freely; default with no mode flag = --audit, read-only):
   --embed-fonts          Embed every used font whose fsType permits it; report the rest.
   --externalize-videos   Portability for presentation, but not for the .pptx: pull embedded videos
                          OUT to a sidecar folder and link to them, shrinking the .pptx for transport.
+  --compress-videos      Transcode embedded videos with ffmpeg (H.264/AAC, --crf) to shrink the
+                         deck while keeping it self-contained. Requires ffmpeg on PATH.
+  --zip                  Zip the output (.pptx + sidecar media, if any) into one archive.
 
-Writes go to dist/<input-name> by default (override with -o).
+Writes go to <input-stem>-postprocessed/<input-name> by default (override with -o).
 
 Run:   uv run make_portable.py INPUT.pptx --audit
        uv run make_portable.py INPUT.pptx --fix-links --embed-fonts
+       uv run make_portable.py INPUT.pptx --compress-videos --crf 30 --zip
        uv run make_portable.py INPUT.pptx --externalize-videos
 """
 
@@ -156,6 +160,9 @@ class Package:
     def text(self, name: str) -> str:
         return self._zf.read(name).decode("utf-8")
 
+    def stream(self, name: str):
+        return self._zf.open(name, "r")
+
     def size(self, name: str) -> int:
         return self._info[name].file_size
 
@@ -179,7 +186,9 @@ class Package:
                     continue
                 if name in modified:
                     zi = zipfile.ZipInfo(name, date_time=info.date_time)
-                    zi.compress_type = zipfile.ZIP_DEFLATED
+                    # Don't waste CPU re-deflating already-compressed media.
+                    zi.compress_type = (zipfile.ZIP_STORED if ext_of(name) in MEDIA_EXTS
+                                        else zipfile.ZIP_DEFLATED)
                     zi.external_attr = info.external_attr
                     zout.writestr(zi, modified[name])
                     continue
@@ -734,11 +743,17 @@ def _wire_font_parts(pkg: Package, modified: Dict[str, bytes],
 def main(argv: List[str]) -> int:
     ap = argparse.ArgumentParser(description="Make a .pptx fully portable.")
     ap.add_argument("input")
-    ap.add_argument("-o", "--output")
+    ap.add_argument("-o", "--output", help="Defaults to <name>-postprocessed/<name>.pptx")
     ap.add_argument("--audit", action="store_true")
     ap.add_argument("--fix-links", action="store_true")
     ap.add_argument("--embed-fonts", action="store_true")
     ap.add_argument("--externalize-videos", action="store_true")
+    ap.add_argument("--compress-videos", action="store_true",
+                    help="Transcode embedded videos with ffmpeg (H.264/AAC) to shrink the deck")
+    ap.add_argument("--crf", type=int, default=28,
+                    help="x264 quality for --compress-videos (lower=better/bigger; default 28)")
+    ap.add_argument("--zip", action="store_true",
+                    help="Zip the output (.pptx + sidecar media, if any) into <outdir>/<name>.zip")
     ap.add_argument("--media-dir", help="Sidecar folder name for externalized videos")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
@@ -747,7 +762,8 @@ def main(argv: List[str]) -> int:
         print(f"error: no such file: {args.input}", file=sys.stderr)
         return 2
 
-    do_write = args.fix_links or args.embed_fonts or args.externalize_videos
+    do_write = (args.fix_links or args.embed_fonts or args.externalize_videos
+                or args.compress_videos or args.zip)
     report = Report()
 
     with Package(args.input) as pkg:
@@ -759,8 +775,9 @@ def main(argv: List[str]) -> int:
             _emit(report, args)
             return 0
 
+        stem = os.path.splitext(os.path.basename(args.input))[0]
         out_path = os.path.abspath(
-            args.output or os.path.join("dist", os.path.basename(args.input)))
+            args.output or os.path.join(f"{stem}-postprocessed", os.path.basename(args.input)))
         if out_path == os.path.abspath(args.input):
             print("error: refusing to overwrite the input in place", file=sys.stderr)
             return 2
@@ -782,6 +799,8 @@ def main(argv: List[str]) -> int:
 
         if args.fix_links:
             fix_links(pkg, modified, report)
+        if args.compress_videos:
+            compress_videos(pkg, modified, report, args.crf)
         if args.externalize_videos:
             externalize_videos(pkg, modified, dropped, media_dirname, report)
         if args.embed_fonts:
@@ -789,10 +808,11 @@ def main(argv: List[str]) -> int:
 
         pkg.rewrite(out_path, modified, dropped, added)
 
-        # Externalize: write the extracted media binaries to the sidecar folder.
+        # Externalize: write the extracted media binaries (compressed ones, if produced
+        # earlier this run) to the sidecar folder.
         if args.externalize_videos:
             _extract_media(args.input, report.data.get("extracted_parts", []),
-                           media_dir_path, report)
+                           media_dir_path, report, overrides=modified)
 
         before = os.path.getsize(args.input)
         after = os.path.getsize(out_path)
@@ -802,21 +822,89 @@ def main(argv: List[str]) -> int:
             f"officecli validate: {officecli_validate(out_path)}",
         ])
 
+        if args.zip:
+            zip_path = re.sub(r"\.pptx$", ".zip", out_path)
+            _zip_output(out_path, media_dir_path if args.externalize_videos else None, zip_path)
+            report.section("Zip", [
+                f"archive: {zip_path} ({human(os.path.getsize(zip_path))})",
+                "loose output files kept alongside the archive."])
+
     _emit(report, args)
     return 0
 
 
-def _extract_media(input_path: str, parts: List[str], dest_dir: str, report: Report):
+def compress_videos(pkg: Package, modified: Dict[str, bytes], report: Report, crf: int) -> int:
+    """Transcode embedded videos with ffmpeg (H.264/AAC) to shrink them in place.
+
+    Writes the smaller bytes into `modified` so the videos stay embedded (self-contained).
+    Returns the number of videos actually shrunk.
+    """
+    import tempfile
+
+    if shutil.which("ffmpeg") is None:
+        report.section("compress-videos", ["ffmpeg not found on PATH — skipped (brew install ffmpeg)"])
+        return 0
+
+    video_parts = [n for n in pkg.names
+                   if n.startswith("ppt/media/") and ext_of(n) in VIDEO_EXTS]
+    lines: List[str] = []
+    shrunk = 0
+    for part in video_parts:
+        orig = pkg.size(part)
+        ext = ext_of(part)  # keep the same container so the content-type stays valid
+        with tempfile.TemporaryDirectory() as td:
+            src = os.path.join(td, "in" + ext)
+            dst = os.path.join(td, "out" + ext)
+            with pkg.stream(part) as s, open(src, "wb") as f:
+                shutil.copyfileobj(s, f, 1024 * 1024)
+            cmd = ["ffmpeg", "-y", "-i", src,
+                   "-c:v", "libx264", "-crf", str(crf), "-preset", "medium",
+                   "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+                   "-movflags", "+faststart", dst]
+            p = subprocess.run(cmd, capture_output=True, text=True)
+            if p.returncode != 0 or not os.path.exists(dst):
+                tail = (p.stderr or "").strip().splitlines()[-1:] or ["unknown error"]
+                lines.append(f"{basename(part)}: ffmpeg failed, kept original ({tail[0]})")
+                continue
+            data = open(dst, "rb").read()
+            if len(data) >= orig:
+                lines.append(f"{basename(part)}: re-encode not smaller, kept original ({human(orig)})")
+                continue
+            modified[part] = data
+            shrunk += 1
+            lines.append(f"{basename(part)}: {human(orig)} -> {human(len(data))} "
+                         f"(-{100 * (orig - len(data)) // orig}%)")
+    report.section(f"compress-videos (crf={crf})", lines or ["no embedded videos found"])
+    return shrunk
+
+
+def _extract_media(input_path: str, parts: List[str], dest_dir: str, report: Report,
+                   overrides: Optional[Dict[str, bytes]] = None):
+    overrides = overrides or {}
     os.makedirs(dest_dir, exist_ok=True)
     written = []
     with zipfile.ZipFile(input_path, "r") as zf:
         for part in parts:
             out = os.path.join(dest_dir, basename(part))
-            with zf.open(part, "r") as src, open(out, "wb") as dst:
-                shutil.copyfileobj(src, dst, length=1024 * 1024)
+            if part in overrides:  # e.g. a compressed video produced earlier this run
+                with open(out, "wb") as dst:
+                    dst.write(overrides[part])
+            else:
+                with zf.open(part, "r") as src, open(out, "wb") as dst:
+                    shutil.copyfileobj(src, dst, length=1024 * 1024)
             written.append(f"{basename(part)} ({human(os.path.getsize(out))})")
     report.section("Sidecar media folder", [f"dir: {dest_dir}"] + written +
                    ["KEEP this folder next to the .pptx — linked videos are not self-contained."])
+
+
+def _zip_output(pptx_path: str, media_dir: Optional[str], zip_path: str) -> None:
+    """Zip the output .pptx (and its sidecar media folder, if any) into one archive."""
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as z:
+        z.write(pptx_path, os.path.basename(pptx_path))
+        if media_dir and os.path.isdir(media_dir):
+            base = os.path.basename(media_dir)
+            for fn in sorted(os.listdir(media_dir)):
+                z.write(os.path.join(media_dir, fn), f"{base}/{fn}")
 
 
 def _emit(report: Report, args):
